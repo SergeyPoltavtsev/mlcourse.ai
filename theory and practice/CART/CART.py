@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 from enum import Enum
+import time
 from sklearn.base import BaseEstimator
 
 
@@ -18,7 +19,8 @@ def entropy(y):
     if (len(y) == 0):
         return 0
     portions = get_proportions(y)
-    entropy = -np.sum(portions*np.log2(portions))
+    #entropy = -np.sum(portions*np.log2(portions))
+    entropy = -np.dot(portions, np.log2(portions))
     return entropy
 
 
@@ -29,7 +31,8 @@ def gini(y):
     if (len(y) == 0):
         return 0
     portions = get_proportions(y)
-    gini_impurity = 1 - np.sum(np.square(portions))
+    #gini_impurity = 1 - np.sum(np.square(portions))
+    gini_impurity = 1 - np.dot(portions, portions)
     return gini_impurity
 
 
@@ -39,8 +42,8 @@ def variance(y):
     '''
     if (len(y) == 0):
         return 0
-    # return np.var(y)
-    return np.sum(np.square(y-np.mean(y)))/(len(y)*1.0)
+    # return np.sum(np.square(y-np.mean(y)))/(len(y)*1.0)
+    return np.var(y)
 
 
 def mad_median(y):
@@ -49,23 +52,16 @@ def mad_median(y):
     '''
     if (len(y) == 0):
         return 0
-    # return np.mean(np.abs(y - np.median(y)))
-    return np.sum(np.abs(y-np.median(y)))/(len(y)*1.0)
+    # return np.sum(np.abs(y-np.median(y)))/(len(y)*1.0)
+    return np.mean(np.abs(y - np.median(y)))
 
 
 def information_gain(current_uncertainty, left, right, criterion=gini):
+    '''
+        Calculates information gain
+    '''
     proportion = len(left) * 1.0 / (len(left)+len(right))
     return current_uncertainty - proportion * criterion(left) - (1.0 - proportion) * criterion(right)
-
-
-def is_numeric(value):
-    '''
-    Tests if the value is of numeric type.
-    '''
-    if(isinstance(value, pd.Series)):
-        return np.issubdtype(value.dtype, np.number)
-    else:
-        return isinstance(value, int) or isinstance(value, float)
 
 
 criterions = {'gini': gini,
@@ -74,33 +70,18 @@ criterions = {'gini': gini,
               'mad_median': mad_median}
 
 
-def listLabelsToSeries(Y):
-    if isinstance(Y, pd.Series):
-        return Y
-    return pd.Series(Y, name='target')
-
-
-def arrayToDataFrame(X):
-    '''
-    Converts numpy nd array to pandas dataframe
-    '''
-    if not isinstance(X, (np.ndarray, list)):
-        return X
-
-    columns = ['column' + str(i) for i in range(np.shape(X)[1])]
-    return pd.DataFrame(data=X, columns=columns)
-
-
 class TreeType(Enum):
     REGRESSION = 1
     CLASSIFICATION = 2
 
 
 class TreeLeaf():
-    def __init__(self, X):
-        self.labels = X.iloc[:, -1]
-        self.most_frequent = self.labels.value_counts().index[0]
-        self.mean = self.labels.mean()
+    def __init__(self, y, tree_type):
+        self.labels = y
+        if tree_type == TreeType.CLASSIFICATION:
+            self.predicted_value = np.bincount(self.labels).argmax() #self.labels.value_counts().index[0]
+        else:
+            self.predicted_value = self.labels.mean()
         self.unique = np.unique(self.labels)
         self.proportions = get_proportions(self.labels)
         self.class_proportions = dict(zip(self.unique, self.proportions))
@@ -108,7 +89,7 @@ class TreeLeaf():
 
 class TreeNode():
     def __init__(self, node_criterion, left=None, right=None):
-        self.node_critetion = node_criterion
+        self.node_criterion = node_criterion
         self.left = left
         self.right = right
 
@@ -122,58 +103,78 @@ class NodeCriterion():
     based on feature value stored in the criterion.
     '''
 
-    def __init__(self, column_name, value):
-        self.column_name = column_name
+    def __init__(self, feature_idx, value):
+        self.feature_idx = feature_idx
         self.value = value
 
-    def partition(self, X):
-        # Partitions a dataset into two subsets based on a criterion\
-        if is_numeric(X[self.column_name]):
-            Xl = X[X[self.column_name] >= self.value]
-            Xr = X[X[self.column_name] < self.value]
-        else:
-            Xl = X[X[self.column_name] == self.value]
-            Xr = X[X[self.column_name] != self.value]
-        return Xl, Xr
+    def partition(self, X, y = None):
+        '''
+        Partitions the set based on the critetion. 
+        For a training set partitions both features and labels.
+        For a test set partitions only the features.
+        '''
+        mask = X[:, self.feature_idx] < self.value
+
+        Xl = X[mask, :]
+        Xr = X[~mask, :]
+
+        yl = None
+        yr = None
+        if y is not None:
+            yl = y[mask]
+            yr = y[~mask]
+
+        return mask, Xl, Xr, yl, yr
 
     def __repr__(self):
-        operator = "=="
-        if is_numeric(self.value):
-            operator = ">="
-        return "Criterion: %s %s %s" % (self.column_name, operator, str(self.value))
+        return "Node criterion: %s < %s" % (self.feature_idx, str(self.value))
 
 
 class DecisionTree(BaseEstimator):
+    def __init__(self, max_depth=np.inf, min_samples_split=2, criterion='gini', debug=False):
+        # To make the DecisionTree class work with the GridSearchCV and others when combined in a Pipeline.
+        params = {
+            'max_depth': max_depth,
+            'min_samples_split': min_samples_split,
+            'criterion': criterion,
+            'debug': debug
+        }
+        self.set_params(**params)
 
-    def __init__(self, max_depth=np.inf, min_sample_split=2, criterion='gini', debug=False):
-        self.max_depth = max_depth
-        self.min_sample_split = min_sample_split
-        self.tree_type = TreeType.CLASSIFICATION if criterion in ['gini', 'entropy'] else TreeType.REGRESSION
-        # needed for the get_params function to work properly
-        self.criterion=criterion
-        self.criterion_function = criterions[criterion]
-        self.debug = debug
+        if self.debug:
+            print("\nDecisionTree params:")
+            print("max_depth = {}, min_samples_split = {}, criterion = {}\n".format(
+                max_depth, min_samples_split, criterion))
+
+    def set_params(self, **params):
+        super().set_params(**params)
+
+        self._critetion_function = criterions[self.criterion]
+        self.tree_type = TreeType.CLASSIFICATION if self.criterion in [
+            'gini', 'entropy'] else TreeType.REGRESSION
         self.root_node = None
 
-    def find_best_split(self, X):
+        return self
+
+    def find_best_split(self, X, y):
         '''
         Find the best split for a dataset iteration over the features and feature values
         '''
         best_gain = 0
         best_node_criterion = None
-        current_uncertainty = self.criterion_function(X.iloc[:, -1])
+        current_uncertainty = self._critetion_function(y)
+        _, n_features = X.shape
 
         # exclude the last column (targets)
-        for feature in X.columns[:-1]:
-            for value in X[feature].unique():
-                node_criterion = NodeCriterion(feature, value)
-                Xl, Xr = node_criterion.partition(X)
-
+        for feature_idx in range(n_features):
+            for value in np.unique(X[:, feature_idx]):
+                node_criterion = NodeCriterion(feature_idx, value)
+                _, Xl, Xr, yl, yr = node_criterion.partition(X, y)
+                
                 if Xl.shape[0] == 0 or Xr.shape[0] == 0:
                     continue
-
                 gain = information_gain(
-                    current_uncertainty, Xl.iloc[:, -1], Xr.iloc[:, -1], criterion=self.criterion_function)
+                    current_uncertainty, yl, yr, criterion=self._critetion_function)
 
                 if gain >= best_gain:
                     best_gain = gain
@@ -181,30 +182,33 @@ class DecisionTree(BaseEstimator):
 
         return best_gain, best_node_criterion
 
-    def fit(self, X, Y):
-        X = arrayToDataFrame(X)
-        Y = listLabelsToSeries(Y)
-        traininig_set = pd.concat([X, Y], axis=1)
-        self.root_node = self._build(traininig_set, 0)
+    def fit(self, X, y):
+        self.root_node = self._build(X, y)
 
-    def _build(self, X, node_depth):
-        gain, node_criterion = self.find_best_split(X)
+    def _build(self, X, y, node_depth=0):
 
-        if self.debug:
-            print('%s gives information gain of %s' % (node_criterion, gain))
+        if len(np.unique(y)) == 1:
+            return TreeLeaf(y, self.tree_type)
 
         if node_depth == self.max_depth:
-            return TreeLeaf(X)
+            return TreeLeaf(y, self.tree_type)
 
-        if X.shape[0] <= self.min_sample_split:
-            return TreeLeaf(X)
+        if X.shape[0] <= self.min_samples_split:
+            return TreeLeaf(y, self.tree_type)
+
+        # find the best split
+        gain, node_criterion = self.find_best_split(X, y)
+
+        if self.debug:
+            print('Best split: %s gives information gain of %s at depth %s' %
+                  (node_criterion, gain, node_depth))
 
         if gain == 0:
-            return TreeLeaf(X)
+            return TreeLeaf(y, self.tree_type)
 
-        Xl, Xr = node_criterion.partition(X)
-        Xl_subtree = self._build(Xl, node_depth+1)
-        Xr_subtree = self._build(Xr, node_depth+1)
+        _, Xl, Xr, yl, yr = node_criterion.partition(X, y)
+        Xl_subtree = self._build(Xl, yl, node_depth+1)
+        Xr_subtree = self._build(Xr, yr, node_depth+1)
 
         return TreeNode(node_criterion, Xl_subtree, Xr_subtree)
 
@@ -219,7 +223,7 @@ class DecisionTree(BaseEstimator):
             print(spacing + 'Predict: ', node.class_proportions)
             return
 
-        print(spacing + str(node.node_critetion))
+        print(spacing + str(node.node_criterion))
 
         print(spacing + '--> True:')
         self._print_node(node.left, spacing + "  ")
@@ -228,28 +232,15 @@ class DecisionTree(BaseEstimator):
         self._print_node(node.right, spacing + "  ")
 
     def predict(self, X):
-        X = arrayToDataFrame(X)
-        predictions = self._traverse_node(self.root_node, X)
-        assert X.shape[0] == predictions.shape[0], 'The amount of predictions does not corresponds to the number of examples'
-        return predictions.sort_index()
+        return np.array([self._predict_object(x) for x in X])
 
-    def _traverse_node(self, node, X):
-        if isinstance(node, TreeLeaf):
-            if self.tree_type == TreeType.CLASSIFICATION:
-                leaf_value = node.most_frequent
+    def _predict_object(self, x):
+        node = self.root_node
+
+        while not isinstance(node, TreeLeaf):
+            if x[node.node_criterion.feature_idx] < node.node_criterion.value:
+                node = node.left
             else:
-                leaf_value = node.mean
-            return pd.Series(data=[leaf_value] * X.shape[0], index=X.index)
-
-        Xl, Xr = node.node_critetion.partition(X)
-
-        left_labels = pd.Series()
-        right_labels = pd.Series()
-
-        if Xl.shape[0] != 0:
-            left_labels = self._traverse_node(node.left, Xl)
-
-        if Xr.shape[0] != 0:
-            right_labels = self._traverse_node(node.right, Xr)
-
-        return left_labels.append(right_labels)
+                node = node.right
+        
+        return node.predicted_value
